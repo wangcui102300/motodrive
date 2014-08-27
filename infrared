@@ -1,0 +1,220 @@
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/fs.h>
+#include <linux/init.h>
+#include <linux/types.h>
+#include <linux/delay.h>
+#include <linux/moduleparam.h>
+#include <linux/poll.h>
+#include <linux/irq.h>
+#include <linux/delay.h>
+#include <asm/irq.h>
+#include <asm/io.h>
+#include <linux/interrupt.h>
+#include <asm/uaccess.h>
+#include <mach/hardware.h>
+#include <linux/platform_device.h>
+#include <linux/cdev.h>
+#include <linux/miscdevice.h>
+#include <linux/ioctl.h>
+#include <mach/map.h>
+#include <mach/gpio.h>
+#include <mach/regs-clock.h>
+#include <mach/regs-gpio.h>
+#include <plat/gpio-cfg.h>
+
+
+#define DEVICE_NAME		"infrared"
+#define DIAMETER_OF_WHEEL		75  //unit is mm
+#define NUM_OF_RASTER	24 
+
+
+
+char read_return[2] = {'0','y'};
+static char obstacle_flag ='0';
+
+struct infrared_desc {
+	int gpio;
+	int number;
+	char *name;
+    int irq;	
+};
+static struct infrared_desc infrared[] = {
+	{ S5PV210_GPH2(1), 1, "infrared0" },
+	//{ S5PV210_GPH2(2), 2, "infrared1" },
+	//{ S5PV210_GPH2(5), 2, "infrared2" },
+	//{ S5PV210_GPH2(6), 3, "infrared3" },
+};
+
+static irqreturn_t infrared_interrupt(int irq, void *dev_id)
+{
+	 
+        struct infrared_desc *bdata = (struct infrared_desc *)dev_id;
+           int number;
+                 number = bdata->number;
+       
+	   printk("KEY %d is up\n", number+1);
+        read_return[0] ='0'+ bdata->number;//返回第几个管脚发生了中断
+          mdelay(37);
+	  
+        printk("infrared irqreturn_t\n");
+         disable_irq_nosync(bdata->irq);
+	  return IRQ_HANDLED;
+}
+
+static int mini210_infrared_open(struct inode *inode, struct file *file)
+{
+	int i;
+	int err = 0;
+
+	for (i = 0; i < ARRAY_SIZE(infrared); i++) {
+		if (!infrared[i].gpio)//initialize gpio low
+			continue;
+
+		infrared[i].irq = gpio_to_irq(infrared[i].gpio);
+		err = request_irq(infrared[i].irq, infrared_interrupt, IRQF_TRIGGER_LOW, 
+				infrared[i].name, (void *)&infrared[i]);
+              
+			  disable_irq(infrared[i].irq); 
+                   s3c_gpio_setpull(infrared[i].gpio,S3C_GPIO_PULL_UP);
+              printk("in  the open irq=%d\n",infrared[i].irq);
+		if (err)
+			break;
+	}
+
+	if (err) {
+		i--;
+		for (; i >= 0; i--) {
+			if (!infrared[i].gpio)
+				continue;
+
+			infrared[i].irq= gpio_to_irq(infrared[i].gpio);
+			disable_irq(infrared[i].irq);
+			free_irq(infrared[i].irq, (void *)&infrared[i]);
+
+		}
+
+		return -EBUSY;
+	}
+	return 0;
+}
+
+static int mini210_infrared_close(struct inode *inode, struct file *file)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(infrared); i++) {
+		if (!infrared[i].gpio)
+			continue;
+
+		infrared[i].irq = gpio_to_irq(infrared[i].gpio);
+		free_irq(infrared[i].irq, (void *)&infrared[i]);
+
+		
+	}
+
+	return 0;
+}
+
+
+static int mini210_infrared_read(struct file *filp, char __user *buff,
+		size_t count, loff_t *offp)
+{       
+	 unsigned long err;
+      //printk("read\n");
+	 /*if (!read_return) {
+		if (filp->f_obstacle_flags & O_NONBLOCK)
+			return -EAGAIN;
+		else
+			wait_event_interruptible(infrared_waitq, read_return);
+	 }
+
+	 read_return = 0;
+    */
+	err = copy_to_user((void *)buff, (const void *)(&read_return),
+			min(sizeof(read_return), count));
+      read_return[0]='0';
+	return err ? -EFAULT : min(sizeof(read_return), count);
+}
+
+
+
+#define MEMDEV_IOC_MAGIC 'k'
+#define INFRARED_DISABLE_IRQ _IOW(MEMDEV_IOC_MAGIC,0,int)
+#define INFRARED_ENABLE_IRQ _IOW(MEMDEV_IOC_MAGIC,1,int)
+
+#define MEMDEV_IOC_MAXNR 2 //定义命令的最大序列号
+
+
+
+static long mini210_infrared_ioctl(struct file *filp, unsigned int cmd,
+		unsigned long arg)
+{ 
+      int err = 0;
+      printk("ioctl cmd=%u arg=%lu\n",cmd,arg);
+
+
+      if (_IOC_TYPE(cmd) != MEMDEV_IOC_MAGIC) 
+           return -EINVAL;
+      if (_IOC_NR(cmd) > MEMDEV_IOC_MAXNR) 
+           return -EINVAL;
+
+	
+	switch(cmd){
+
+	case INFRARED_DISABLE_IRQ:
+			 disable_irq(infrared[arg].irq);
+                   
+                   break;
+	case INFRARED_ENABLE_IRQ:
+                   enable_irq(infrared[arg].irq); 
+                   printk("infrared[%lu].irq=%d\n",arg,infrared[arg].irq);
+                    
+	             break;
+	default:
+	             break;
+       }
+      if (err)  
+           return -ENOTTY; 
+	
+	return 0;
+}
+
+
+static struct file_operations dev_fops = {
+	.owner	= THIS_MODULE,
+	.open		= mini210_infrared_open,
+	.release	= mini210_infrared_close, 
+	.read		= mini210_infrared_read,
+    //.write    = mini210_infrared_write, 
+    .unlocked_ioctl= mini210_infrared_ioctl,
+             
+};
+
+static struct miscdevice misc = {
+	.minor		= MISC_DYNAMIC_MINOR,
+	.name		= DEVICE_NAME,
+	.fops		= &dev_fops,
+};
+
+static int __init infrared_dev_init(void)
+{
+	int ret;
+	ret = misc_register(&misc);
+
+	printk(DEVICE_NAME"\tinitialized\n");
+
+	return ret;
+}
+
+static void __exit infrared_dev_exit(void)
+{
+	misc_deregister(&misc);
+}
+
+module_init(infrared_dev_init);
+module_exit(infrared_dev_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("zsj");
+
